@@ -3,6 +3,7 @@
 """
 import numpy.typing as npt
 import numpy as np
+import shutil
 
 from pathlib import Path
 from pydicom import dcmread
@@ -251,3 +252,33 @@ def read_meta_standard(dicom: Dataset) -> dict:
 
         'containsMetal': 'PLA' not in seriesName
     }
+
+def sort_series(in_dir: str, out_dir: str) -> list[dict]:
+    """Copy the MR images of a DICOM export into one folder per series, named Series<SeriesNumber>.
+
+    Args:
+        in_dir (str): exported DICOM folder; searched recursively
+        out_dir (str): folder where series folders are created
+
+    Returns:
+        list[dict]: summary of each series, with keys 'folder', 'files', 'frames' and 'description'
+    """
+    series = {}
+    for f in sorted(Path(in_dir).rglob('*')):
+        if not f.is_file():
+            continue
+        try:
+            dicom = dcmread(f, stop_before_pixels=True)
+        except InvalidDicomError:
+            continue
+        if dicom.get('SOPClassUID') not in (MR_IMAGE_STORAGE, ENHANCED_MR_IMAGE_STORAGE):
+            continue
+        name = 'Series{}'.format(dicom.SeriesNumber)
+        series_dir = Path(out_dir) / name
+        series_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f, series_dir / '{}.dcm'.format(dicom.SOPInstanceUID))
+        if name not in series:
+            series[name] = {'folder': name, 'files': 0, 'frames': 0, 'description': dicom.get('SeriesDescription') or dicom.get('ProtocolName', '')}
+        series[name]['files'] += 1
+        series[name]['frames'] += int(dicom.get('NumberOfFrames', 1))
+    return sorted(series.values(), key=lambda s: int(s['folder'][len('Series'):]))

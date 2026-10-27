@@ -39,6 +39,10 @@ cd path/to/toniq/analysis/scripts
 bash make_figures.sh save_dir 1
 ```
 
+## Step-by-Step Notebook (Thai)
+
+The [notebooks](notebooks) folder contains a step-by-step Jupyter notebook with instructions in Thai for analyzing a new phantom (e.g. with a pedicle screw), along with `install_windows.bat` and `start_notebook.bat` for setup on Windows. See [notebooks/README.md](notebooks/README.md).
+
 ## Using Data from Other Scanners (e.g. Philips)
 
 The paper data was acquired on a GE scanner. Series folders containing GE-named files (`*MRDC*`) are loaded with GE-specific parsing. Any other series folder is loaded using standard DICOM attributes, which has been written for Philips data and supports both classic (one file per slice) and enhanced (multi-frame) DICOM. Slices are ordered by their position along the slice normal and pixel values are converted to real-world values using the rescale slope & intercept.

@@ -34,7 +34,10 @@ class Metadata:
     def __post_init__(self):
         resolution_rounded = np.round(self.resolution_mm, decimals=1)
         self.isotropic = np.all(resolution_rounded == resolution_rounded[0])
-        self.readoutBandwidth_kHz = np.round(self.pixelBandwidth_Hz * self.acqMatrixShape[self.readoutDirection] * 1e-3, decimals=2)
+        if self.pixelBandwidth_Hz is None or self.readoutDirection is None:
+            self.readoutBandwidth_kHz = None  # not available in all vendors' DICOM
+        else:
+            self.readoutBandwidth_kHz = np.round(self.pixelBandwidth_Hz * self.acqMatrixShape[self.readoutDirection] * 1e-3, decimals=2)
     
 @dataclass
 class ImageVolume:

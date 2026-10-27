@@ -39,6 +39,18 @@ cd path/to/toniq/analysis/scripts
 bash make_figures.sh save_dir 1
 ```
 
+## Using Data from Other Scanners (e.g. Philips)
+
+The paper data was acquired on a GE scanner. Series folders containing GE-named files (`*MRDC*`) are loaded with GE-specific parsing. Any other series folder is loaded using standard DICOM attributes, which has been written for Philips data and supports both classic (one file per slice) and enhanced (multi-frame) DICOM. Slices are ordered by their position along the slice normal and pixel values are converted to real-world values using the rescale slope & intercept.
+
+Scanner exports are usually not organized into one folder per series. Use `sort_dicom.py` to copy the MR images of an export into folders named `Series<SeriesNumber>`, then use the output folder as `root` in your config file and the printed table to fill in `dicom-series`.
+
+```
+python sort_dicom.py path/to/export path/to/sorted
+```
+
+Each series folder must contain a single image type (e.g. magnitude only) and a single echo, otherwise loading fails with an error.
+
 The TONIQ package is documented in-place following the [Google style](https://google.github.io/styleguide/pyguide.html#s3.8-comments-and-docstrings). See `figure[1-10].py` in [scripts](scripts) for example usage of the TONIQ package.
 
 ## Acknowledgements

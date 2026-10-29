@@ -9,7 +9,10 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import scipy.ndimage as ndi
 import sigpy as sp
+from skimage import filters
+from skimage.metrics import structural_similarity
 
 from toniq import ia, gd, snr, sr
 from toniq.dicom import load_series_from_path, sort_series
@@ -17,6 +20,11 @@ from toniq.masks import get_implant_mask, get_signal_mask, get_artifact_mask
 from toniq.util import equalize, masked_copy, normalize
 
 AXIS_NAMES = ('axis 0 (rows)', 'axis 1 (columns)', 'axis 2 (slices)')
+
+# chart colors (dark theme), validated for contrast & color vision deficiency on the dark surface
+DARK = {'surface': '#1a1a19', 'text': '#f0efec', 'secondary': '#c3c2b7', 'muted': '#898781', 'grid': '#2c2c2a', 'axis': '#383835'}
+ZONE_COLORS = ('#86b6ef', '#3987e5', '#1c5cab')  # ordinal blue ramp: near screw -> far
+CONDITION_COLORS = ('#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9', '#e66767')
 
 
 def sort_export(export_folder, sorted_folder):
@@ -134,6 +142,22 @@ def run_sr(volumes, crop, ia_result, gd_result, ia_threshold, gd_threshold=1, nu
     resolution_mm = volumes['structured-metal'].meta.resolution_mm
     _, fwhm = sr.get_map(reference, target, (5, 5, 1), (14, 14, 10), resolution_mm, mask, 1, num_workers=num_workers)
     print('คำนวณ SR map เสร็จแล้ว')
+    return {'fwhm': fwhm, 'mask': mask}
+
+
+def run_sr_baseline(volumes, crop, ia_result, num_workers=None):
+    """ Spatial resolution map of the structured plastic scan, used as the no-metal baseline for SR thresholds. """
+    if num_workers is None:
+        num_workers = os.cpu_count()
+    mask = get_signal_mask(ia_result['implant_mask'])
+    target = volumes['structured-plastic'].data
+    reference = np.abs(sp.ifft(sp.resize(sp.fft(volumes['structured-plastic-reference'].data), target.shape)))
+    images = equalize([reference, target])
+    slc = to_slices(crop, target.shape)
+    reference, target = images[0][slc], images[1][slc]
+    resolution_mm = volumes['structured-plastic'].meta.resolution_mm
+    _, fwhm = sr.get_map(reference, target, (5, 5, 1), (14, 14, 10), resolution_mm, mask, 1, num_workers=num_workers)
+    print('คำนวณ SR baseline (ภาพ plastic) เสร็จแล้ว')
     return {'fwhm': fwhm, 'mask': mask}
 
 
@@ -256,3 +280,266 @@ def _save(fig, save_folder, filename):
     if save_folder is not None:
         Path(save_folder).mkdir(parents=True, exist_ok=True)
         fig.savefig(os.path.join(save_folder, filename), dpi=150, bbox_inches='tight')
+
+
+def make_zones(volumes, crop, edges_mm=(5, 15)):
+    """Divide the analysis region into zones by distance (mm) from the screw surface.
+
+    The screw is taken as the largest dark connected region of the uniform plastic image.
+    Zone 1 spans 0 to edges_mm[0], zone 2 spans edges_mm[0] to edges_mm[1], and zone 3 is everything farther.
+    """
+    (image,) = prepare(volumes, ('uniform-plastic',), crop)
+    labels, count = ndi.label(image < filters.threshold_otsu(image))
+    if count == 0:
+        raise ValueError('ไม่พบสกรูในกรอบ crop กรุณาตรวจกรอบในขั้นที่ 3')
+    sizes = ndi.sum(np.ones_like(labels), labels, index=range(1, count + 1))
+    screw = ndi.binary_fill_holes(labels == 1 + int(np.argmax(sizes)))
+    resolution_mm = volumes['uniform-plastic'].meta.resolution_mm
+    distance_mm = ndi.distance_transform_edt(~screw, sampling=resolution_mm)
+    zones = 1 + np.digitize(distance_mm, edges_mm)
+    zones[screw] = 0
+    names = ['Zone 1 (0-{:g} mm)'.format(edges_mm[0]),
+             'Zone 2 ({:g}-{:g} mm)'.format(*edges_mm),
+             'Zone 3 (>{:g} mm)'.format(edges_mm[1])]
+    voxel_mL = np.prod(resolution_mm) / 1000
+    print('สร้าง zone เสร็จแล้ว (ปริมาตรสกรูที่พบ {:.2f} mL)'.format(screw.sum() * voxel_mL))
+    for i, name in enumerate(names):
+        print('  {:<22} {:>9} voxel  ({:.1f} mL)'.format(name, np.sum(zones == i + 1), np.sum(zones == i + 1) * voxel_mL))
+    return {'zones': zones, 'distance_mm': distance_mm, 'screw': screw, 'names': names, 'edges_mm': tuple(edges_mm)}
+
+
+def run_ssim(volumes, crop, sigma=1.5):
+    """3D SSIM map between the structured plastic (reference) and structured metal images.
+
+    Uses Gaussian-weighted local statistics (sigma in voxels) with sample covariance, matching viqa's SSIM.
+    Voxels within the filter radius of the crop border are marked invalid, as in the standard SSIM mean.
+    """
+    plastic, metal = prepare(volumes, ('structured-plastic', 'structured-metal'), crop)
+    data_range = float(plastic.max() - plastic.min())
+    _, ssim_map = structural_similarity(plastic, metal, data_range=data_range, gaussian_weights=True, sigma=sigma,
+                                        use_sample_covariance=True, full=True)
+    radius = int(3.5 * sigma + 0.5)
+    valid = np.zeros(ssim_map.shape, dtype=bool)
+    valid[tuple(slice(radius, n - radius) for n in ssim_map.shape)] = True
+    print('คำนวณ SSIM map เสร็จแล้ว (sigma = {} voxel, SSIM เฉลี่ยทั้งกรอบ = {:.3f})'.format(sigma, ssim_map[valid].mean()))
+    return {'ssim_map': ssim_map, 'valid': valid, 'plastic': plastic, 'metal': metal, 'sigma': sigma}
+
+
+def _sr_thresholds(sr_baseline, percentile=75):
+    """ Per-axis FWHM threshold (mm) from the plastic baseline. """
+    thresholds = []
+    for i in range(2):
+        fwhm = sr_baseline['fwhm'][..., i]
+        thresholds.append(np.percentile(fwhm[fwhm > 0], percentile))
+    return thresholds
+
+
+def zonal_summary(zone_result, resolution_mm, ia_threshold, ia_result, gd_result=None, snr_result=None,
+                  sr_result=None, sr_baseline=None, ssim_result=None, gd_threshold_px=1, min_coverage_pct=5, save_folder=None):
+    """Summarize each analysis within each zone.
+
+    Coverage is the percentage of the zone where the measure is valid; GD, SNR and SR are not measurable
+    in regions of severe artifact, so a low coverage means the value describes only part of the zone.
+    Values with coverage below min_coverage_pct are reported as unavailable, since too few voxels support them.
+    Measure names are kept the same across runs so that conditions can be compared; settings that differ
+    between runs (e.g. the SSIM sigma or the SR threshold) are recorded in the 'detail' column.
+    """
+    zones = zone_result['zones']
+    rows = []
+
+    def add(measure, zone, value, unit, valid, detail=''):
+        zone_size = np.sum(zones == zone)
+        coverage = 100 * np.sum(valid) / zone_size if zone_size > 0 else 0
+        if coverage < min_coverage_pct:
+            value = None
+        rows.append({'measure': measure, 'zone': zone_result['names'][zone - 1], 'value': float(value) if value is not None else None,
+                     'unit': unit, 'coverage_pct': round(coverage, 1), 'detail': detail})
+
+    sr_thresholds = _sr_thresholds(sr_baseline) if (sr_result is not None and sr_baseline is not None) else None
+    for zone in (1, 2, 3):
+        in_zone = zones == zone
+        artifact = np.abs(ia_result['ia_map']) > ia_threshold
+        add('IA: % voxels with |IA| > threshold', zone, _pct(artifact, in_zone), '%', in_zone, 'threshold {:.0f}%'.format(ia_threshold * 100))
+        if gd_result is not None:
+            valid = in_zone & gd_result['mask']
+            displacement_px = np.linalg.norm(gd_result['gd_map'], axis=-1)
+            displacement_mm = np.linalg.norm(gd_result['gd_map'] * np.array(resolution_mm), axis=-1)
+            add('GD: % voxels displaced > threshold', zone, _pct(displacement_px > gd_threshold_px, valid), '%', valid,
+                'threshold {:g} px'.format(gd_threshold_px))
+            add('GD: max displacement', zone, displacement_mm[valid].max() if valid.any() else None, 'mm', valid)
+        if snr_result is not None:
+            valid = in_zone & snr_result['mask'] & (snr_result['snr_map'] > 0)
+            add('SNR: median', zone, np.median(snr_result['snr_map'][valid]) if valid.any() else None, '', valid)
+        if sr_result is not None:
+            for i in range(2):
+                fwhm = sr_result['fwhm'][..., i]
+                valid = in_zone & (fwhm > 0)
+                add('SR: median FWHM along {}'.format(AXIS_NAMES[i]), zone, np.median(fwhm[valid]) if valid.any() else None, 'mm', valid)
+                if sr_thresholds is not None:
+                    add('SR: % voxels with FWHM along {} > plastic P75'.format(AXIS_NAMES[i]),
+                        zone, _pct(fwhm > sr_thresholds[i], valid), '%', valid, 'plastic P75 {:.2f} mm'.format(sr_thresholds[i]))
+        if ssim_result is not None:
+            valid = in_zone & ssim_result['valid']
+            add('SSIM: mean', zone, ssim_result['ssim_map'][valid].mean() if valid.any() else None, '', valid,
+                'sigma {:g} voxel'.format(ssim_result['sigma']))
+
+    _print_zonal(rows, zone_result['names'], min_coverage_pct)
+    if save_folder is not None:
+        Path(save_folder).mkdir(parents=True, exist_ok=True)
+        with open(os.path.join(save_folder, 'zonal_summary.csv'), 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.DictWriter(f, fieldnames=['measure', 'zone', 'value', 'unit', 'coverage_pct', 'detail'])
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({**row, 'value': '' if row['value'] is None else round(row['value'], 4)})
+        print('\nบันทึกตารางไว้ที่ {}'.format(os.path.join(save_folder, 'zonal_summary.csv')))
+    return rows
+
+
+def _pct(condition, valid):
+    return 100 * np.sum(condition & valid) / np.sum(valid) if np.any(valid) else None
+
+
+def _print_zonal(rows, zone_names, min_coverage_pct):
+    measures = list(dict.fromkeys(row['measure'] for row in rows))
+    print('{:<62}'.format('ค่า') + ''.join('{:>24}'.format(name) for name in zone_names))
+    for measure in measures:
+        cells = []
+        for name in zone_names:
+            row = next(r for r in rows if r['measure'] == measure and r['zone'] == name)
+            value = 'n/a' if row['value'] is None else '{:.2f} {}'.format(row['value'], row['unit']).strip()
+            cells.append('{:>24}'.format('{} [{:.1f}%]'.format(value, row['coverage_pct'])))
+        detail = next(r['detail'] for r in rows if r['measure'] == measure)
+        print('{:<62}'.format(measure[:61]) + ''.join(cells) + ('   ({})'.format(detail) if detail else ''))
+    print('\n[ตัวเลขในวงเล็บ] = ร้อยละของ zone ที่วัดค่าได้ (coverage); n/a = coverage ต่ำกว่า {:g}% จึงไม่รายงานค่า'.format(min_coverage_pct))
+
+
+def show_zones(zone_result, ssim_result, ia_result, index=None, axis=2, save_folder=None):
+    """ Show structured plastic & metal images, their difference, the SSIM map and the IA map with zone boundaries. """
+    distance = zone_result['distance_mm']
+    if index is None:
+        index = int(np.argmax(np.sum(zone_result['screw'], axis=tuple(a for a in range(3) if a != axis))))
+    take = lambda arr: np.take(arr, index, axis=axis)
+    panels = [
+        ('Structured plastic', take(ssim_result['plastic']), dict(cmap='gray', vmin=0, vmax=1)),
+        ('Structured metal', take(ssim_result['metal']), dict(cmap='gray', vmin=0, vmax=1)),
+        ('|Metal - plastic|', take(np.abs(ssim_result['metal'] - ssim_result['plastic'])), dict(cmap='gray', vmin=0, vmax=0.5)),
+        ('SSIM (sigma {:g})'.format(ssim_result['sigma']), take(np.where(ssim_result['valid'], ssim_result['ssim_map'], np.nan)), dict(cmap='Blues_r', vmin=0, vmax=1)),
+        ('Intensity artifact', take(ia_result['ia_map']), dict(cmap='RdBu_r', vmin=-0.8, vmax=0.8)),
+    ]
+    fig, axes = plt.subplots(1, 5, figsize=(22, 5))
+    for ax, (title, image, kwargs) in zip(axes, panels):
+        im = ax.imshow(image, **kwargs)
+        ax.contour(take(zone_result['screw']).astype(float), levels=[0.5], colors='#f0efec', linewidths=1.5)
+        ax.contour(take(distance), levels=list(zone_result['edges_mm']), colors=['#eda100', '#e87ba4'], linewidths=1.5)
+        ax.set_title(title)
+        if title.startswith('SSIM') or title.startswith('Intensity'):
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.text(0.5, 0.02, 'white = screw surface,  yellow = {:g} mm,  pink = {:g} mm from screw surface'.format(*zone_result['edges_mm']),
+             ha='center')
+    _finish(fig, axes, '{} = {}'.format(AXIS_NAMES[axis], index), save_folder, 'zones_{}_{}.png'.format(axis, index))
+
+
+def _dark_axes(ax):
+    ax.set_facecolor(DARK['surface'])
+    for side in ('top', 'right', 'left'):
+        ax.spines[side].set_visible(False)
+    ax.spines['bottom'].set_color(DARK['axis'])
+    ax.tick_params(colors=DARK['muted'], length=0)
+    ax.yaxis.grid(True, color=DARK['grid'], linewidth=0.8)
+    ax.set_axisbelow(True)
+    ax.title.set_color(DARK['text'])
+
+
+def _bar_panels(measures):
+    """ Pick measures to plot: percentages share a 0-100 scale; SSIM gets its own 0-1 panel. """
+    return [m for m in measures if m.startswith(('IA:', 'GD: %', 'SR: %', 'SSIM'))]
+
+
+def _wrap(text, width=34):
+    words, lines, line = text.split(), [], ''
+    for word in words:
+        if len(line) + len(word) + 1 > width and line:
+            lines.append(line)
+            line = word
+        else:
+            line = (line + ' ' + word).strip()
+    return '\n'.join(lines + [line])
+
+
+def plot_zonal(rows, zone_names, save_folder=None):
+    """ Dark-themed bar charts of each percentage measure and SSIM by zone (one panel per measure). """
+    measures = _bar_panels(list(dict.fromkeys(row['measure'] for row in rows)))
+    fig, axes = plt.subplots(1, len(measures), figsize=(3.6 * len(measures), 4.2), squeeze=False)
+    fig.patch.set_facecolor(DARK['surface'])
+    for ax, measure in zip(axes[0], measures):
+        values = [next(r['value'] for r in rows if r['measure'] == measure and r['zone'] == name) for name in zone_names]
+        heights = [0 if v is None else v for v in values]
+        bars = ax.bar(range(3), heights, width=0.62, color=ZONE_COLORS, edgecolor=DARK['surface'], linewidth=2)
+        for bar, value in zip(bars, values):
+            label = 'n/a' if value is None else ('{:.2f}'.format(value) if measure.startswith('SSIM') else '{:.0f}%'.format(value))
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), label, ha='center', va='bottom', color=DARK['secondary'], fontsize=9)
+        ax.set_ylim(0, 1.05 if measure.startswith('SSIM') else 105)
+        ax.set_xticks(range(3))
+        ax.set_xticklabels([name.replace(' (', '\n(') for name in zone_names], color=DARK['secondary'], fontsize=8)
+        ax.set_title(_wrap(measure), fontsize=9)
+        _dark_axes(ax)
+    fig.tight_layout()
+    _save(fig, save_folder, 'zonal_summary.png')
+    plt.show()
+
+
+def compare_conditions(conditions, save_folder=None):
+    """Compare zonal summaries from several result folders, e.g. {'Parallel to B0': folder1, 'Perpendicular': folder2}.
+
+    Saves a combined CSV and dark-themed grouped bar charts (one panel per measure, bars grouped by zone).
+    """
+    if len(conditions) > len(CONDITION_COLORS):
+        raise ValueError('เปรียบเทียบได้ไม่เกิน {} เงื่อนไขในกราฟเดียว'.format(len(CONDITION_COLORS)))
+    tables = {}
+    for name, folder in conditions.items():
+        with open(os.path.join(folder, 'zonal_summary.csv'), encoding='utf-8-sig') as f:
+            tables[name] = list(csv.DictReader(f))
+        print('โหลด {} จาก {}'.format(name, folder))
+    all_rows = [row for table in tables.values() for row in table]
+    zone_names = list(dict.fromkeys(row['zone'] for row in all_rows))
+    all_measures = list(dict.fromkeys(row['measure'] for row in all_rows))
+    measures = _bar_panels(all_measures)
+
+    def value(name, measure, zone):
+        row = next((r for r in tables[name] if r['measure'] == measure and r['zone'] == zone), None)
+        return None if row is None or row['value'] == '' else float(row['value'])
+
+    fig, axes = plt.subplots(1, len(measures), figsize=(4.2 * len(measures), 4.6), squeeze=False)
+    fig.patch.set_facecolor(DARK['surface'])
+    width = 0.8 / len(conditions)
+    for ax, measure in zip(axes[0], measures):
+        for j, name in enumerate(conditions):
+            values = [value(name, measure, zone) for zone in zone_names]
+            positions = np.arange(len(zone_names)) - 0.4 + width * (j + 0.5)
+            ax.bar(positions, [0 if v is None else v for v in values], width=width, color=CONDITION_COLORS[j],
+                   edgecolor=DARK['surface'], linewidth=2, label=name)
+            for position, v in zip(positions, values):
+                if v is None:
+                    ax.text(position, 0, 'n/a', ha='center', va='bottom', color=DARK['muted'], fontsize=7)
+        ax.set_ylim(0, 1.05 if measure.startswith('SSIM') else 105)
+        ax.set_xticks(range(len(zone_names)))
+        ax.set_xticklabels([zone.replace(' (', '\n(') for zone in zone_names], color=DARK['secondary'], fontsize=8)
+        ax.set_title(_wrap(measure), fontsize=9)
+        _dark_axes(ax)
+    legend = fig.legend(*axes[0][0].get_legend_handles_labels(), loc='upper center', ncol=len(conditions), frameon=False,
+                        bbox_to_anchor=(0.5, 1.02))
+    for text in legend.get_texts():
+        text.set_color(DARK['text'])
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    _save(fig, save_folder, 'comparison.png')
+    plt.show()
+
+    if save_folder is not None:
+        Path(save_folder).mkdir(parents=True, exist_ok=True)
+        with open(os.path.join(save_folder, 'comparison.csv'), 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(['measure', 'zone'] + list(conditions))
+            for measure in all_measures:
+                for zone in zone_names:
+                    writer.writerow([measure, zone] + ['' if value(name, measure, zone) is None else value(name, measure, zone) for name in conditions])
+        print('บันทึกตารางเปรียบเทียบไว้ที่ {}'.format(os.path.join(save_folder, 'comparison.csv')))

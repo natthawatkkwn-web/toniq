@@ -12,7 +12,6 @@ import numpy as np
 import scipy.ndimage as ndi
 import sigpy as sp
 from skimage import filters
-from skimage.metrics import structural_similarity
 
 from toniq import ia, gd, snr, sr
 from toniq.dicom import load_series_from_path, sort_series
@@ -308,21 +307,81 @@ def make_zones(volumes, crop, edges_mm=(5, 15)):
     return {'zones': zones, 'distance_mm': distance_mm, 'screw': screw, 'names': names, 'edges_mm': tuple(edges_mm)}
 
 
-def run_ssim(volumes, crop, sigma=1.5):
-    """3D SSIM map between the structured plastic (reference) and structured metal images.
+def masked_ssim_map(reference, target, mask, sigma, data_range):
+    """SSIM map whose Gaussian-weighted local statistics use only voxels inside mask.
 
-    Uses Gaussian-weighted local statistics (sigma in voxels) with sample covariance, matching viqa's SSIM.
-    Voxels within the filter radius of the crop border are marked invalid, as in the standard SSIM mean.
+    Each local mean, variance and covariance is a weighted average over the in-mask voxels of the window
+    (normalized convolution), so excluded regions such as the screw body do not contribute.
+    Without excluded voxels this equals the standard SSIM (skimage / viqa, sample covariance, K1=0.01, K2=0.03).
+    Voxels outside mask are set to NaN.
+    """
+    def smooth(arr):
+        return ndi.gaussian_filter(arr, sigma, truncate=3.5)
+
+    weight = mask.astype(np.float64)
+    x = reference.astype(np.float64)
+    y = target.astype(np.float64)
+    norm = smooth(weight)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        ux = smooth(x * weight) / norm
+        uy = smooth(y * weight) / norm
+        vx = smooth(x * x * weight) / norm - ux ** 2
+        vy = smooth(y * y * weight) / norm - uy ** 2
+        vxy = smooth(x * y * weight) / norm - ux * uy
+    taps = 2 * int(3.5 * sigma + 0.5) + 1
+    cov_norm = taps ** x.ndim / (taps ** x.ndim - 1)  # sample covariance, as in skimage & viqa
+    c1 = (0.01 * data_range) ** 2
+    c2 = (0.03 * data_range) ** 2
+    ssim = ((2 * ux * uy + c1) * (2 * cov_norm * vxy + c2)) / ((ux ** 2 + uy ** 2 + c1) * (cov_norm * (vx + vy) + c2))
+    ssim[~mask] = np.nan
+    return ssim
+
+
+def run_ssim(volumes, crop, zone_result, sigma=1.5):
+    """3D SSIM map between the structured plastic (reference) and structured metal images, excluding the screw.
+
+    The screw body is dark in both images and would otherwise raise SSIM next to the screw, so it is left out
+    of every window (see masked_ssim_map). Voxels within the filter radius of the crop border are marked invalid,
+    as in the standard SSIM mean.
     """
     plastic, metal = prepare(volumes, ('structured-plastic', 'structured-metal'), crop)
     data_range = float(plastic.max() - plastic.min())
-    _, ssim_map = structural_similarity(plastic, metal, data_range=data_range, gaussian_weights=True, sigma=sigma,
-                                        use_sample_covariance=True, full=True)
+    outside_screw = ~zone_result['screw']
+    ssim_map = masked_ssim_map(plastic, metal, outside_screw, sigma, data_range)
     radius = int(3.5 * sigma + 0.5)
     valid = np.zeros(ssim_map.shape, dtype=bool)
     valid[tuple(slice(radius, n - radius) for n in ssim_map.shape)] = True
-    print('คำนวณ SSIM map เสร็จแล้ว (sigma = {} voxel, SSIM เฉลี่ยทั้งกรอบ = {:.3f})'.format(sigma, ssim_map[valid].mean()))
+    valid &= outside_screw
+    print('คำนวณ SSIM map เสร็จแล้ว (ไม่รวมตัวสกรู, sigma = {} voxel, SSIM เฉลี่ยทั้งกรอบ = {:.3f})'.format(sigma, ssim_map[valid].mean()))
     return {'ssim_map': ssim_map, 'valid': valid, 'plastic': plastic, 'metal': metal, 'sigma': sigma}
+
+
+def ssim_sensitivity(volumes, crop, zone_result, sigmas=(1.0, 1.5, 2.0), save_folder=None):
+    """Sensitivity of zonal SSIM to the window size: mean SSIM per zone for each sigma.
+
+    The window size is also given in mm (in-plane voxel size) as the Gaussian FWHM, 2.355 sigma.
+    """
+    voxel_mm = volumes['structured-plastic'].meta.resolution_mm[0]
+    zones = zone_result['zones']
+    rows = []
+    for sigma in sigmas:
+        result = run_ssim(volumes, crop, zone_result, sigma=sigma)
+        means = [result['ssim_map'][result['valid'] & (zones == zone)].mean() for zone in (1, 2, 3)]
+        rows.append({'sigma_voxel': sigma, 'window_fwhm_mm': round(2.355 * sigma * voxel_mm, 2),
+                     **{name: round(float(m), 4) for name, m in zip(zone_result['names'], means)}})
+    print('\n{:<14}{:>18}'.format('sigma (voxel)', 'FWHM หน้าต่าง (mm)') + ''.join('{:>22}'.format(n) for n in zone_result['names']))
+    for row in rows:
+        print('{:<14}{:>18}'.format(row['sigma_voxel'], row['window_fwhm_mm']) + ''.join('{:>22.3f}'.format(row[n]) for n in zone_result['names']))
+    spread = [max(r[n] for r in rows) - min(r[n] for r in rows) for n in zone_result['names']]
+    print('{:<32}'.format('ช่วงที่ค่าเปลี่ยน (max - min)') + ''.join('{:>22.3f}'.format(v) for v in spread))
+    if save_folder is not None:
+        Path(save_folder).mkdir(parents=True, exist_ok=True)
+        with open(os.path.join(save_folder, 'ssim_sensitivity.csv'), 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.DictWriter(f, fieldnames=['sigma_voxel', 'window_fwhm_mm'] + zone_result['names'])
+            writer.writeheader()
+            writer.writerows(rows)
+        print('\nบันทึกตารางไว้ที่ {}'.format(os.path.join(save_folder, 'ssim_sensitivity.csv')))
+    return rows
 
 
 def _sr_thresholds(sr_baseline, percentile=75):
@@ -381,7 +440,7 @@ def zonal_summary(zone_result, resolution_mm, ia_threshold, ia_result, gd_result
         if ssim_result is not None:
             valid = in_zone & ssim_result['valid']
             add('SSIM: mean', zone, ssim_result['ssim_map'][valid].mean() if valid.any() else None, '', valid,
-                'sigma {:g} voxel'.format(ssim_result['sigma']))
+                'screw excluded, sigma {:g} voxel'.format(ssim_result['sigma']))
 
     _print_zonal(rows, zone_result['names'], min_coverage_pct)
     if save_folder is not None:
@@ -423,7 +482,8 @@ def show_zones(zone_result, ssim_result, ia_result, index=None, axis=2, save_fol
         ('Structured plastic', take(ssim_result['plastic']), dict(cmap='gray', vmin=0, vmax=1)),
         ('Structured metal', take(ssim_result['metal']), dict(cmap='gray', vmin=0, vmax=1)),
         ('|Metal - plastic|', take(np.abs(ssim_result['metal'] - ssim_result['plastic'])), dict(cmap='gray', vmin=0, vmax=0.5)),
-        ('SSIM (sigma {:g})'.format(ssim_result['sigma']), take(np.where(ssim_result['valid'], ssim_result['ssim_map'], np.nan)), dict(cmap='Blues_r', vmin=0, vmax=1)),
+        ('SSIM, screw excluded (sigma {:g})'.format(ssim_result['sigma']), take(np.where(ssim_result['valid'], ssim_result['ssim_map'], np.nan)),
+         dict(cmap='Blues_r', vmin=0, vmax=1)),
         ('Intensity artifact', take(ia_result['ia_map']), dict(cmap='RdBu_r', vmin=-0.8, vmax=0.8)),
     ]
     fig, axes = plt.subplots(1, 5, figsize=(22, 5))

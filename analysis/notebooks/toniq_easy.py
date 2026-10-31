@@ -161,6 +161,16 @@ def run_sr_baseline(volumes, crop, ia_result, num_workers=None):
     return {'fwhm': fwhm, 'mask': mask}
 
 
+def direction_labels(volume):
+    """ Name each image axis by its encoding direction (frequency, phase, slice) from the scan metadata. """
+    readout = volume.meta.readoutDirection
+    if readout is None:
+        return AXIS_NAMES
+    labels = ['phase (axis {})'.format(i) for i in range(2)] + ['slice (axis 2)']
+    labels[readout] = 'frequency (axis {})'.format(readout)
+    return tuple(labels)
+
+
 def _center(arr, axis):
     return arr.shape[axis] // 2
 
@@ -179,14 +189,14 @@ def show_ia(result, index=None, axis=2, save_folder=None):
     _finish(fig, axes, '{} = {}'.format(AXIS_NAMES[axis], index), save_folder, 'ia_{}_{}.png'.format(axis, index))
 
 
-def show_gd(result, index=None, axis=2, save_folder=None):
+def show_gd(result, index=None, axis=2, save_folder=None, axis_labels=AXIS_NAMES):
     """ Show displacement maps (pixels) along each axis for one slice. """
     index = _center(result['mask'], axis) if index is None else index
     mask = np.take(result['mask'], index, axis=axis)
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     for i in range(3):
         gd.plot_map(axes[i], np.take(result['gd_map'][..., i], index, axis=axis) * mask, mask, show_cbar=(i == 2))
-        axes[i].set_title('Displacement along {}'.format(AXIS_NAMES[i]))
+        axes[i].set_title('Displacement along {}'.format(axis_labels[i]))
     _finish(fig, axes, '{} = {}'.format(AXIS_NAMES[axis], index), save_folder, 'gd_{}_{}.png'.format(axis, index))
 
 
@@ -282,7 +292,7 @@ def _save(fig, save_folder, filename):
         fig.savefig(os.path.join(save_folder, filename), dpi=150, bbox_inches='tight')
 
 
-def make_zones(volumes, crop, edges_mm=(5, 15)):
+def make_zones(volumes, crop, edges_mm=(10, 20)):
     """Divide the analysis region into zones by distance (mm) from the screw surface.
 
     The screw is taken as the largest dark connected region of the uniform plastic image.
@@ -395,8 +405,8 @@ def _sr_thresholds(sr_baseline, percentile=75):
 
 
 def zonal_summary(zone_result, resolution_mm, ia_threshold, ia_result, gd_result=None, snr_result=None,
-                  sr_result=None, sr_baseline=None, ssim_result=None, gd_threshold_px=1, min_coverage_pct=5,
-                  sr_percentiles=(95, 75), save_folder=None):
+                  sr_result=None, sr_baseline=None, ssim_result=None, gd_threshold_mm=1, min_coverage_pct=5,
+                  sr_percentiles=(95, 75), axis_labels=AXIS_NAMES, save_folder=None):
     """Summarize each analysis within each zone.
 
     Coverage is the percentage of the zone where the measure is valid; GD, SNR and SR are not measurable
@@ -404,6 +414,8 @@ def zonal_summary(zone_result, resolution_mm, ia_threshold, ia_result, gd_result
     Values with coverage below min_coverage_pct are reported as unavailable, since too few voxels support them.
     The Blurring Volume (BV) counts valid voxels whose FWHM exceeds a percentile of the plastic baseline FWHM,
     for each of sr_percentiles (the first is the primary threshold; the others are for sensitivity analysis).
+    GD volume counts valid voxels displaced by more than gd_threshold_mm along each direction (frequency, phase, slice).
+    axis_labels names the image axes, e.g. from direction_labels(); defaults to array axis names.
     Measure names are kept the same across runs so that conditions can be compared; settings that differ
     between runs (e.g. the SSIM sigma or the SR threshold) are recorded in the 'detail' column.
     """
@@ -428,11 +440,16 @@ def zonal_summary(zone_result, resolution_mm, ia_threshold, ia_result, gd_result
         add('IA: % voxels with |IA| > threshold', zone, _pct(artifact, in_zone), '%', in_zone, 'threshold {:.0f}%'.format(ia_threshold * 100))
         if gd_result is not None:
             valid = in_zone & gd_result['mask']
-            displacement_px = np.linalg.norm(gd_result['gd_map'], axis=-1)
-            displacement_mm = np.linalg.norm(gd_result['gd_map'] * np.array(resolution_mm), axis=-1)
-            add('GD: % voxels displaced > threshold', zone, _pct(displacement_px > gd_threshold_px, valid), '%', valid,
-                'threshold {:g} px'.format(gd_threshold_px))
-            add('GD: max displacement', zone, displacement_mm[valid].max() if valid.any() else None, 'mm', valid)
+            detail = 'threshold {:g} mm'.format(gd_threshold_mm)
+            for i in range(3):
+                displacement_mm = np.abs(gd_result['gd_map'][..., i] * resolution_mm[i])
+                displaced = valid & (displacement_mm > gd_threshold_mm)
+                name = 'GD: volume displaced > threshold along {}'.format(axis_labels[i])
+                add(name + ' [% of valid]', zone, _pct(displaced, valid), '%', valid, detail)
+                add(name + ' [voxels]', zone, np.sum(displaced), 'voxels', valid, detail)
+                add(name + ' [cm3]', zone, np.sum(displaced) * voxel_cm3, 'cm3', valid, detail)
+                add('GD: max |displacement| along {}'.format(axis_labels[i]), zone,
+                    displacement_mm[valid].max() if valid.any() else None, 'mm', valid)
         if snr_result is not None:
             valid = in_zone & snr_result['mask'] & (snr_result['snr_map'] > 0)
             add('SNR: median', zone, np.median(snr_result['snr_map'][valid]) if valid.any() else None, '', valid)
@@ -440,11 +457,11 @@ def zonal_summary(zone_result, resolution_mm, ia_threshold, ia_result, gd_result
             for i in range(2):
                 fwhm = sr_result['fwhm'][..., i]
                 valid = in_zone & (fwhm > 0)
-                add('SR: median FWHM along {}'.format(AXIS_NAMES[i]), zone, np.median(fwhm[valid]) if valid.any() else None, 'mm', valid)
+                add('SR: median FWHM along {}'.format(axis_labels[i]), zone, np.median(fwhm[valid]) if valid.any() else None, 'mm', valid)
                 for p, thresholds in sr_thresholds.items():
                     blurred = valid & (fwhm > thresholds[i])
                     detail = 'plastic P{} = {:.2f} mm'.format(p, thresholds[i])
-                    name = 'SR: BV along {} (> plastic P{})'.format(AXIS_NAMES[i], p)
+                    name = 'SR: BV along {} (> plastic P{})'.format(axis_labels[i], p)
                     add(name + ' [% of valid]', zone, _pct(blurred, valid), '%', valid, detail)
                     add(name + ' [voxels]', zone, np.sum(blurred), 'voxels', valid, detail)
                     add(name + ' [cm3]', zone, np.sum(blurred) * voxel_cm3, 'cm3', valid, detail)
@@ -471,7 +488,7 @@ def _pct(condition, valid):
 
 def _print_zonal(rows, zone_names, min_coverage_pct):
     measures = list(dict.fromkeys(row['measure'] for row in rows))
-    print('{:<62}'.format('ค่า') + ''.join('{:>24}'.format(name) for name in zone_names))
+    print('{:<72}'.format('ค่า') + ''.join('{:>24}'.format(name) for name in zone_names))
     for measure in measures:
         cells = []
         for name in zone_names:
@@ -479,7 +496,7 @@ def _print_zonal(rows, zone_names, min_coverage_pct):
             value = 'n/a' if row['value'] is None else '{:.2f} {}'.format(row['value'], row['unit']).strip()
             cells.append('{:>24}'.format('{} [{:.1f}%]'.format(value, row['coverage_pct'])))
         detail = next(r['detail'] for r in rows if r['measure'] == measure)
-        print('{:<62}'.format(measure[:61]) + ''.join(cells) + ('   ({})'.format(detail) if detail else ''))
+        print('{:<72}'.format(measure[:71]) + ''.join(cells) + ('   ({})'.format(detail) if detail else ''))
     print('\n[ตัวเลขในวงเล็บ] = ร้อยละของ zone ที่วัดค่าได้ (coverage); n/a = coverage ต่ำกว่า {:g}% จึงไม่รายงานค่า'.format(min_coverage_pct))
 
 
@@ -525,7 +542,8 @@ def _bar_panels(measures):
     """ Pick measures to plot: percentages share a 0-100 scale; SSIM gets its own 0-1 panel. """
     # SR: only the primary (first listed) percentile threshold, as % of valid voxels
     sr_primary = next((re.search(r'plastic P\d+', m).group() for m in measures if m.startswith('SR: BV')), None)
-    return [m for m in measures if m.startswith(('IA:', 'GD: %', 'SSIM'))
+    return [m for m in measures if m.startswith(('IA:', 'SSIM'))
+            or (m.startswith('GD: volume') and m.endswith('[% of valid]'))
             or (sr_primary is not None and m.startswith('SR: BV') and sr_primary + ')' in m and m.endswith('[% of valid]'))]
 
 

@@ -5,6 +5,7 @@ matplotlib's default font lacks Thai glyphs.
 """
 import csv
 import os
+import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -394,12 +395,15 @@ def _sr_thresholds(sr_baseline, percentile=75):
 
 
 def zonal_summary(zone_result, resolution_mm, ia_threshold, ia_result, gd_result=None, snr_result=None,
-                  sr_result=None, sr_baseline=None, ssim_result=None, gd_threshold_px=1, min_coverage_pct=5, save_folder=None):
+                  sr_result=None, sr_baseline=None, ssim_result=None, gd_threshold_px=1, min_coverage_pct=5,
+                  sr_percentiles=(95, 75), save_folder=None):
     """Summarize each analysis within each zone.
 
     Coverage is the percentage of the zone where the measure is valid; GD, SNR and SR are not measurable
     in regions of severe artifact, so a low coverage means the value describes only part of the zone.
     Values with coverage below min_coverage_pct are reported as unavailable, since too few voxels support them.
+    The Blurring Volume (BV) counts valid voxels whose FWHM exceeds a percentile of the plastic baseline FWHM,
+    for each of sr_percentiles (the first is the primary threshold; the others are for sensitivity analysis).
     Measure names are kept the same across runs so that conditions can be compared; settings that differ
     between runs (e.g. the SSIM sigma or the SR threshold) are recorded in the 'detail' column.
     """
@@ -414,7 +418,10 @@ def zonal_summary(zone_result, resolution_mm, ia_threshold, ia_result, gd_result
         rows.append({'measure': measure, 'zone': zone_result['names'][zone - 1], 'value': float(value) if value is not None else None,
                      'unit': unit, 'coverage_pct': round(coverage, 1), 'detail': detail})
 
-    sr_thresholds = _sr_thresholds(sr_baseline) if (sr_result is not None and sr_baseline is not None) else None
+    sr_thresholds = {}
+    if sr_result is not None and sr_baseline is not None:
+        sr_thresholds = {p: _sr_thresholds(sr_baseline, percentile=p) for p in sr_percentiles}
+    voxel_cm3 = np.prod(resolution_mm) / 1000
     for zone in (1, 2, 3):
         in_zone = zones == zone
         artifact = np.abs(ia_result['ia_map']) > ia_threshold
@@ -434,9 +441,13 @@ def zonal_summary(zone_result, resolution_mm, ia_threshold, ia_result, gd_result
                 fwhm = sr_result['fwhm'][..., i]
                 valid = in_zone & (fwhm > 0)
                 add('SR: median FWHM along {}'.format(AXIS_NAMES[i]), zone, np.median(fwhm[valid]) if valid.any() else None, 'mm', valid)
-                if sr_thresholds is not None:
-                    add('SR: % voxels with FWHM along {} > plastic P75'.format(AXIS_NAMES[i]),
-                        zone, _pct(fwhm > sr_thresholds[i], valid), '%', valid, 'plastic P75 {:.2f} mm'.format(sr_thresholds[i]))
+                for p, thresholds in sr_thresholds.items():
+                    blurred = valid & (fwhm > thresholds[i])
+                    detail = 'plastic P{} = {:.2f} mm'.format(p, thresholds[i])
+                    name = 'SR: BV along {} (> plastic P{})'.format(AXIS_NAMES[i], p)
+                    add(name + ' [% of valid]', zone, _pct(blurred, valid), '%', valid, detail)
+                    add(name + ' [voxels]', zone, np.sum(blurred), 'voxels', valid, detail)
+                    add(name + ' [cm3]', zone, np.sum(blurred) * voxel_cm3, 'cm3', valid, detail)
         if ssim_result is not None:
             valid = in_zone & ssim_result['valid']
             add('SSIM: mean', zone, ssim_result['ssim_map'][valid].mean() if valid.any() else None, '', valid,
@@ -512,7 +523,10 @@ def _dark_axes(ax):
 
 def _bar_panels(measures):
     """ Pick measures to plot: percentages share a 0-100 scale; SSIM gets its own 0-1 panel. """
-    return [m for m in measures if m.startswith(('IA:', 'GD: %', 'SR: %', 'SSIM'))]
+    # SR: only the primary (first listed) percentile threshold, as % of valid voxels
+    sr_primary = next((re.search(r'plastic P\d+', m).group() for m in measures if m.startswith('SR: BV')), None)
+    return [m for m in measures if m.startswith(('IA:', 'GD: %', 'SSIM'))
+            or (sr_primary is not None and m.startswith('SR: BV') and sr_primary + ')' in m and m.endswith('[% of valid]'))]
 
 
 def _wrap(text, width=34):

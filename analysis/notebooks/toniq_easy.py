@@ -24,6 +24,7 @@ AXIS_NAMES = ('axis 0 (rows)', 'axis 1 (columns)', 'axis 2 (slices)')
 # chart colors (dark theme), validated for contrast & color vision deficiency on the dark surface
 DARK = {'surface': '#1a1a19', 'text': '#f0efec', 'secondary': '#c3c2b7', 'muted': '#898781', 'grid': '#2c2c2a', 'axis': '#383835'}
 ZONE_COLORS = ('#86b6ef', '#3987e5', '#1c5cab')  # ordinal blue ramp: near screw -> far
+WHOLE_REGION = 'Whole region'
 CONDITION_COLORS = ('#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9', '#e66767')
 
 
@@ -405,13 +406,14 @@ def _sr_thresholds(sr_baseline, n_sd=2):
     return thresholds
 
 
-def _region_measures(region, resolution_mm, ia_threshold, ia_result, gd_result, snr_result, sr_result,
-                     sr_thresholds, ssim_result, gd_threshold_mm, axis_labels):
+def _region_measures(region, resolution_mm, ia_threshold, ia_result=None, gd_result=None, snr_result=None, sr_result=None,
+                     sr_thresholds=None, ssim_result=None, gd_threshold_mm=1, axis_labels=AXIS_NAMES):
     """ Each measure within one region: list of (measure, value, unit, valid voxel mask, detail). """
     voxel_cm3 = np.prod(resolution_mm) / 1000
     out = []
-    artifact = np.abs(ia_result['ia_map']) > ia_threshold
-    out.append(('IA: % voxels with |IA| > threshold', _pct(artifact, region), '%', region, 'threshold {:.0f}%'.format(ia_threshold * 100)))
+    if ia_result is not None:
+        artifact = np.abs(ia_result['ia_map']) > ia_threshold
+        out.append(('IA: % voxels with |IA| > threshold', _pct(artifact, region), '%', region, 'threshold {:.0f}%'.format(ia_threshold * 100)))
     if gd_result is not None:
         valid = region & gd_result['mask']
         detail = 'threshold {:g} mm'.format(gd_threshold_mm)
@@ -432,7 +434,7 @@ def _region_measures(region, resolution_mm, ia_threshold, ia_result, gd_result, 
             fwhm = sr_result['fwhm'][..., i]
             valid = region & (fwhm > 0)
             out.append(('SR: median FWHM along {}'.format(axis_labels[i]), np.median(fwhm[valid]) if valid.any() else None, 'mm', valid, ''))
-            for label, thresholds in sr_thresholds.items():
+            for label, thresholds in (sr_thresholds or {}).items():
                 blurred = valid & (fwhm > thresholds[i])
                 detail = 'plastic {} = {:.2f} mm'.format(label, thresholds[i])
                 name = 'SR: BV along {} (> plastic {})'.format(axis_labels[i], label)
@@ -452,26 +454,31 @@ def _all_region_rows(zone_result, by_slice, resolution_mm, ia_threshold, ia_resu
     if sr_result is not None and sr_baseline is not None:
         sr_thresholds = {'mean+{:g}SD'.format(k): _sr_thresholds(sr_baseline, n_sd=k) for k in sr_sd}
     zones = zone_result['zones']
+    # IA, GD, SNR and SR cover the whole analysis region (crop excluding the screw); only SSIM is split by zone
+    groups = [(WHOLE_REGION, zones > 0, dict(ia_result=ia_result, gd_result=gd_result, snr_result=snr_result,
+                                              sr_result=sr_result, ssim_result=None))]
+    if ssim_result is not None:
+        groups += [(name, zones == i + 1, dict(ia_result=None, gd_result=None, snr_result=None, sr_result=None,
+                                                ssim_result=ssim_result)) for i, name in enumerate(zone_result['names'])]
     rows = []
-    for zone in (1, 2, 3):
-        in_zone = zones == zone
-        regions = [(None, in_zone)]
+    for group_name, in_group, results in groups:
+        regions = [(None, in_group)]
         if by_slice:
             regions = []
             for k in range(zones.shape[2]):
-                region = np.zeros_like(in_zone)
-                region[..., k] = in_zone[..., k]
+                region = np.zeros_like(in_group)
+                region[..., k] = in_group[..., k]
                 if region.any():
                     regions.append((k, region))
         for k, region in regions:
             size = np.sum(region)
             for measure, value, unit, valid, detail in _region_measures(
-                    region, resolution_mm, ia_threshold, ia_result, gd_result, snr_result, sr_result, sr_thresholds,
-                    ssim_result, gd_threshold_mm, axis_labels):
+                    region, resolution_mm, ia_threshold, sr_thresholds=sr_thresholds, gd_threshold_mm=gd_threshold_mm,
+                    axis_labels=axis_labels, **results):
                 coverage = 100 * np.sum(valid) / size
                 if coverage < min_coverage_pct:
                     value = None
-                row = {'measure': measure, 'zone': zone_result['names'][zone - 1], 'value': None if value is None else float(value),
+                row = {'measure': measure, 'zone': group_name, 'value': None if value is None else float(value),
                        'unit': unit, 'coverage_pct': round(coverage, 1), 'detail': detail}
                 if by_slice:
                     row = {'slice': k, **row}
@@ -491,9 +498,11 @@ def _write_rows(rows, path):
 def zonal_summary(zone_result, resolution_mm, ia_threshold, ia_result, gd_result=None, snr_result=None,
                   sr_result=None, sr_baseline=None, ssim_result=None, gd_threshold_mm=1, min_coverage_pct=5,
                   sr_sd=(2, 1), axis_labels=AXIS_NAMES, save_folder=None):
-    """Summarize each analysis within each zone; with save_folder, also save per-slice values within each zone.
+    """Summarize IA, GD, SNR and SR over the whole analysis region, and SSIM within each zone.
 
-    Coverage is the percentage of the zone where the measure is valid; GD, SNR and SR are not measurable
+    The whole analysis region is the crop excluding the screw; zones (by distance from the screw) apply to SSIM only.
+    With save_folder, per-slice values are also saved (slice_summary.csv).
+    Coverage is the percentage of the region where the measure is valid; GD, SNR and SR are not measurable
     in regions of severe artifact, so a low coverage means the value describes only part of the zone.
     Values with coverage below min_coverage_pct are reported as unavailable, since too few voxels support them.
     The Blurring Volume (BV) counts valid voxels whose FWHM exceeds the plastic baseline mean + k SD for each k
@@ -506,7 +515,7 @@ def zonal_summary(zone_result, resolution_mm, ia_threshold, ia_result, gd_result
     args = (resolution_mm, ia_threshold, ia_result, gd_result, snr_result, sr_result, sr_baseline, ssim_result,
             gd_threshold_mm, min_coverage_pct, sr_sd, axis_labels)
     rows = _all_region_rows(zone_result, False, *args)
-    _print_zonal(rows, zone_result['names'], min_coverage_pct)
+    _print_zonal(rows, [WHOLE_REGION] + zone_result['names'], min_coverage_pct)
     if save_folder is not None:
         _write_rows(rows, os.path.join(save_folder, 'zonal_summary.csv'))
         _write_rows(_all_region_rows(zone_result, True, *args), os.path.join(save_folder, 'slice_summary.csv'))
@@ -524,12 +533,15 @@ def _print_zonal(rows, zone_names, min_coverage_pct):
     for measure in measures:
         cells = []
         for name in zone_names:
-            row = next(r for r in rows if r['measure'] == measure and r['zone'] == name)
+            row = next((r for r in rows if r['measure'] == measure and r['zone'] == name), None)
+            if row is None:
+                cells.append('{:>24}'.format('-'))
+                continue
             value = 'n/a' if row['value'] is None else '{:.2f} {}'.format(row['value'], row['unit']).strip()
             cells.append('{:>24}'.format('{} [{:.1f}%]'.format(value, row['coverage_pct'])))
         detail = next(r['detail'] for r in rows if r['measure'] == measure)
         print('{:<72}'.format(measure[:71]) + ''.join(cells) + ('   ({})'.format(detail) if detail else ''))
-    print('\n[ตัวเลขในวงเล็บ] = ร้อยละของ zone ที่วัดค่าได้ (coverage); n/a = coverage ต่ำกว่า {:g}% จึงไม่รายงานค่า'.format(min_coverage_pct))
+    print('\n[ตัวเลขในวงเล็บ] = ร้อยละของพื้นที่ที่วัดค่าได้ (coverage); n/a = coverage ต่ำกว่า {:g}% จึงไม่รายงานค่า; - = ไม่ได้คำนวณแยก zone'.format(min_coverage_pct))
 
 
 def show_zones(zone_result, ssim_result, ia_result, index=None, axis=2, save_folder=None):
@@ -593,18 +605,22 @@ def _wrap(text, width=34):
 def plot_zonal(rows, zone_names, save_folder=None):
     """ Dark-themed bar charts of each percentage measure and SSIM by zone (one panel per measure). """
     measures = _bar_panels(list(dict.fromkeys(row['measure'] for row in rows)))
-    fig, axes = plt.subplots(1, len(measures), figsize=(3.6 * len(measures), 4.2), squeeze=False)
+    widths = [1.6 + 0.9 * len([r for r in rows if r['measure'] == m]) for m in measures]
+    fig, axes = plt.subplots(1, len(measures), figsize=(sum(widths), 4.2), squeeze=False, gridspec_kw={'width_ratios': widths})
     fig.patch.set_facecolor(DARK['surface'])
     for ax, measure in zip(axes[0], measures):
-        values = [next(r['value'] for r in rows if r['measure'] == measure and r['zone'] == name) for name in zone_names]
+        groups = [r['zone'] for r in rows if r['measure'] == measure]
+        values = [next(r['value'] for r in rows if r['measure'] == measure and r['zone'] == name) for name in groups]
         heights = [0 if v is None else v for v in values]
-        bars = ax.bar(range(3), heights, width=0.62, color=ZONE_COLORS, edgecolor=DARK['surface'], linewidth=2)
+        colors = [ZONE_COLORS[zone_names.index(g)] if g in zone_names else CONDITION_COLORS[0] for g in groups]
+        bars = ax.bar(range(len(groups)), heights, width=0.62, color=colors, edgecolor=DARK['surface'], linewidth=2)
         for bar, value in zip(bars, values):
             label = 'n/a' if value is None else ('{:.2f}'.format(value) if measure.startswith('SSIM') else '{:.0f}%'.format(value))
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), label, ha='center', va='bottom', color=DARK['secondary'], fontsize=9)
         ax.set_ylim(0, 1.05 if measure.startswith('SSIM') else 105)
-        ax.set_xticks(range(3))
-        ax.set_xticklabels([name.replace(' (', '\n(') for name in zone_names], color=DARK['secondary'], fontsize=8)
+        ax.set_xlim(-0.8, len(groups) - 0.2)
+        ax.set_xticks(range(len(groups)))
+        ax.set_xticklabels([name.replace(' (', '\n(') for name in groups], color=DARK['secondary'], fontsize=8)
         ax.set_title(_wrap(measure), fontsize=9)
         _dark_axes(ax)
     fig.tight_layout()
@@ -633,21 +649,24 @@ def compare_conditions(conditions, save_folder=None):
         row = next((r for r in tables[name] if r['measure'] == measure and r['zone'] == zone), None)
         return None if row is None or row['value'] == '' else float(row['value'])
 
-    fig, axes = plt.subplots(1, len(measures), figsize=(4.2 * len(measures), 4.6), squeeze=False)
+    widths = [1.6 + 1.4 * len({r['zone'] for r in all_rows if r['measure'] == m}) for m in measures]
+    fig, axes = plt.subplots(1, len(measures), figsize=(sum(widths), 4.6), squeeze=False, gridspec_kw={'width_ratios': widths})
     fig.patch.set_facecolor(DARK['surface'])
     width = 0.8 / len(conditions)
     for ax, measure in zip(axes[0], measures):
+        groups = list(dict.fromkeys(r['zone'] for r in all_rows if r['measure'] == measure))
         for j, name in enumerate(conditions):
-            values = [value(name, measure, zone) for zone in zone_names]
-            positions = np.arange(len(zone_names)) - 0.4 + width * (j + 0.5)
+            values = [value(name, measure, zone) for zone in groups]
+            positions = np.arange(len(groups)) - 0.4 + width * (j + 0.5)
             ax.bar(positions, [0 if v is None else v for v in values], width=width, color=CONDITION_COLORS[j],
                    edgecolor=DARK['surface'], linewidth=2, label=name)
             for position, v in zip(positions, values):
                 if v is None:
                     ax.text(position, 0, 'n/a', ha='center', va='bottom', color=DARK['muted'], fontsize=7)
         ax.set_ylim(0, 1.05 if measure.startswith('SSIM') else 105)
-        ax.set_xticks(range(len(zone_names)))
-        ax.set_xticklabels([zone.replace(' (', '\n(') for zone in zone_names], color=DARK['secondary'], fontsize=8)
+        ax.set_xlim(-0.6, len(groups) - 0.4)
+        ax.set_xticks(range(len(groups)))
+        ax.set_xticklabels([zone.replace(' (', '\n(') for zone in groups], color=DARK['secondary'], fontsize=8)
         ax.set_title(_wrap(measure), fontsize=9)
         _dark_axes(ax)
     legend = fig.legend(*axes[0][0].get_legend_handles_labels(), loc='upper center', ncol=len(conditions), frameon=False,
@@ -664,7 +683,7 @@ def compare_conditions(conditions, save_folder=None):
             writer = csv.writer(f)
             writer.writerow(['measure', 'zone'] + list(conditions))
             for measure in all_measures:
-                for zone in zone_names:
+                for zone in dict.fromkeys(r['zone'] for r in all_rows if r['measure'] == measure):
                     writer.writerow([measure, zone] + ['' if value(name, measure, zone) is None else value(name, measure, zone) for name in conditions])
         print('บันทึกตารางเปรียบเทียบไว้ที่ {}'.format(os.path.join(save_folder, 'comparison.csv')))
 
@@ -733,8 +752,9 @@ def compare_statistics(protocols, design='repeat_zone', save_folder=None):
         groups = {}
         for row in first:
             for i in range(len(repeats[names[0]])):
-                groups.setdefault((row['measure'], 'all zones'), []).append((i, row['zone']))
-        for (measure, label), blocks in groups.items():
+                groups.setdefault(row['measure'], []).append((i, row['zone']))
+        for measure, blocks in groups.items():
+            label = 'repeat x zone' if len({z for _, z in blocks}) > 1 else 'repeat'
             if measure.endswith('[voxels]'):
                 continue
             table = []

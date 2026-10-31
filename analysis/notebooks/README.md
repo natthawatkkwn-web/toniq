@@ -64,6 +64,8 @@
 | `overview.png`, `ia_*.png`, `gd_*.png`, `snr_*.png`, `sr_*.png` | รูปสำหรับใส่ในรายงานหรือสไลด์ |
 | `zonal_summary.csv`, `zonal_summary.png`, `zones_*.png` | ผลแยกตามระยะห่างจากผิวสกรู (zone) รวม SSIM (ขั้นที่ 9) |
 | `comparison.csv`, `comparison.png` | เปรียบเทียบหลายเงื่อนไข (ขั้นที่ 10) |
+| `slice_summary.csv` | ค่าราย slice ในแต่ละ zone (ใช้กับสถิติแบบ zone × slice) |
+| `stats_friedman.csv`, `stats_posthoc.csv`, `stats_descriptive.csv` | สถิติเปรียบเทียบ protocol: Friedman, Wilcoxon รายคู่ (Holm) และ mean ± SD (ขั้นที่ 11) |
 | `*.npy` | ข้อมูล map ทั้งหมด สำหรับวิเคราะห์เพิ่มเติมภายหลัง |
 
 ### หมายเหตุเรื่อง SSIM

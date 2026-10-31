@@ -395,90 +395,122 @@ def ssim_sensitivity(volumes, crop, zone_result, sigmas=(1.0, 1.5, 2.0), save_fo
     return rows
 
 
-def _sr_thresholds(sr_baseline, percentile=75):
-    """ Per-axis FWHM threshold (mm) from the plastic baseline. """
+def _sr_thresholds(sr_baseline, n_sd=2):
+    """ Per-axis FWHM threshold (mm) from the plastic baseline: mean + n_sd standard deviations. """
     thresholds = []
     for i in range(2):
         fwhm = sr_baseline['fwhm'][..., i]
-        thresholds.append(np.percentile(fwhm[fwhm > 0], percentile))
+        fwhm = fwhm[fwhm > 0]
+        thresholds.append(fwhm.mean() + n_sd * fwhm.std())
     return thresholds
+
+
+def _region_measures(region, resolution_mm, ia_threshold, ia_result, gd_result, snr_result, sr_result,
+                     sr_thresholds, ssim_result, gd_threshold_mm, axis_labels):
+    """ Each measure within one region: list of (measure, value, unit, valid voxel mask, detail). """
+    voxel_cm3 = np.prod(resolution_mm) / 1000
+    out = []
+    artifact = np.abs(ia_result['ia_map']) > ia_threshold
+    out.append(('IA: % voxels with |IA| > threshold', _pct(artifact, region), '%', region, 'threshold {:.0f}%'.format(ia_threshold * 100)))
+    if gd_result is not None:
+        valid = region & gd_result['mask']
+        detail = 'threshold {:g} mm'.format(gd_threshold_mm)
+        for i in range(3):
+            displacement_mm = np.abs(gd_result['gd_map'][..., i] * resolution_mm[i])
+            displaced = valid & (displacement_mm > gd_threshold_mm)
+            name = 'GD: volume displaced > threshold along {}'.format(axis_labels[i])
+            out.append((name + ' [% of valid]', _pct(displaced, valid), '%', valid, detail))
+            out.append((name + ' [voxels]', np.sum(displaced), 'voxels', valid, detail))
+            out.append((name + ' [cm3]', np.sum(displaced) * voxel_cm3, 'cm3', valid, detail))
+            out.append(('GD: max |displacement| along {}'.format(axis_labels[i]),
+                        displacement_mm[valid].max() if valid.any() else None, 'mm', valid, ''))
+    if snr_result is not None:
+        valid = region & snr_result['mask'] & (snr_result['snr_map'] > 0)
+        out.append(('SNR: median', np.median(snr_result['snr_map'][valid]) if valid.any() else None, '', valid, ''))
+    if sr_result is not None:
+        for i in range(2):
+            fwhm = sr_result['fwhm'][..., i]
+            valid = region & (fwhm > 0)
+            out.append(('SR: median FWHM along {}'.format(axis_labels[i]), np.median(fwhm[valid]) if valid.any() else None, 'mm', valid, ''))
+            for label, thresholds in sr_thresholds.items():
+                blurred = valid & (fwhm > thresholds[i])
+                detail = 'plastic {} = {:.2f} mm'.format(label, thresholds[i])
+                name = 'SR: BV along {} (> plastic {})'.format(axis_labels[i], label)
+                out.append((name + ' [% of valid]', _pct(blurred, valid), '%', valid, detail))
+                out.append((name + ' [voxels]', np.sum(blurred), 'voxels', valid, detail))
+                out.append((name + ' [cm3]', np.sum(blurred) * voxel_cm3, 'cm3', valid, detail))
+    if ssim_result is not None:
+        valid = region & ssim_result['valid']
+        out.append(('SSIM: mean', ssim_result['ssim_map'][valid].mean() if valid.any() else None, '', valid,
+                    'screw excluded, sigma {:g} voxel'.format(ssim_result['sigma'])))
+    return out
+
+
+def _all_region_rows(zone_result, by_slice, resolution_mm, ia_threshold, ia_result, gd_result, snr_result, sr_result,
+                     sr_baseline, ssim_result, gd_threshold_mm, min_coverage_pct, sr_sd, axis_labels):
+    sr_thresholds = {}
+    if sr_result is not None and sr_baseline is not None:
+        sr_thresholds = {'mean+{:g}SD'.format(k): _sr_thresholds(sr_baseline, n_sd=k) for k in sr_sd}
+    zones = zone_result['zones']
+    rows = []
+    for zone in (1, 2, 3):
+        in_zone = zones == zone
+        regions = [(None, in_zone)]
+        if by_slice:
+            regions = []
+            for k in range(zones.shape[2]):
+                region = np.zeros_like(in_zone)
+                region[..., k] = in_zone[..., k]
+                if region.any():
+                    regions.append((k, region))
+        for k, region in regions:
+            size = np.sum(region)
+            for measure, value, unit, valid, detail in _region_measures(
+                    region, resolution_mm, ia_threshold, ia_result, gd_result, snr_result, sr_result, sr_thresholds,
+                    ssim_result, gd_threshold_mm, axis_labels):
+                coverage = 100 * np.sum(valid) / size
+                if coverage < min_coverage_pct:
+                    value = None
+                row = {'measure': measure, 'zone': zone_result['names'][zone - 1], 'value': None if value is None else float(value),
+                       'unit': unit, 'coverage_pct': round(coverage, 1), 'detail': detail}
+                if by_slice:
+                    row = {'slice': k, **row}
+                rows.append(row)
+    return rows
+
+
+def _write_rows(rows, path):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({**row, 'value': '' if row['value'] is None else round(row['value'], 4)})
 
 
 def zonal_summary(zone_result, resolution_mm, ia_threshold, ia_result, gd_result=None, snr_result=None,
                   sr_result=None, sr_baseline=None, ssim_result=None, gd_threshold_mm=1, min_coverage_pct=5,
-                  sr_percentiles=(95, 75), axis_labels=AXIS_NAMES, save_folder=None):
-    """Summarize each analysis within each zone.
+                  sr_sd=(2, 1), axis_labels=AXIS_NAMES, save_folder=None):
+    """Summarize each analysis within each zone; with save_folder, also save per-slice values within each zone.
 
     Coverage is the percentage of the zone where the measure is valid; GD, SNR and SR are not measurable
     in regions of severe artifact, so a low coverage means the value describes only part of the zone.
     Values with coverage below min_coverage_pct are reported as unavailable, since too few voxels support them.
-    The Blurring Volume (BV) counts valid voxels whose FWHM exceeds a percentile of the plastic baseline FWHM,
-    for each of sr_percentiles (the first is the primary threshold; the others are for sensitivity analysis).
+    The Blurring Volume (BV) counts valid voxels whose FWHM exceeds the plastic baseline mean + k SD for each k
+    in sr_sd (the first is the primary threshold; the others are for sensitivity analysis).
     GD volume counts valid voxels displaced by more than gd_threshold_mm along each direction (frequency, phase, slice).
     axis_labels names the image axes, e.g. from direction_labels(); defaults to array axis names.
     Measure names are kept the same across runs so that conditions can be compared; settings that differ
     between runs (e.g. the SSIM sigma or the SR threshold) are recorded in the 'detail' column.
     """
-    zones = zone_result['zones']
-    rows = []
-
-    def add(measure, zone, value, unit, valid, detail=''):
-        zone_size = np.sum(zones == zone)
-        coverage = 100 * np.sum(valid) / zone_size if zone_size > 0 else 0
-        if coverage < min_coverage_pct:
-            value = None
-        rows.append({'measure': measure, 'zone': zone_result['names'][zone - 1], 'value': float(value) if value is not None else None,
-                     'unit': unit, 'coverage_pct': round(coverage, 1), 'detail': detail})
-
-    sr_thresholds = {}
-    if sr_result is not None and sr_baseline is not None:
-        sr_thresholds = {p: _sr_thresholds(sr_baseline, percentile=p) for p in sr_percentiles}
-    voxel_cm3 = np.prod(resolution_mm) / 1000
-    for zone in (1, 2, 3):
-        in_zone = zones == zone
-        artifact = np.abs(ia_result['ia_map']) > ia_threshold
-        add('IA: % voxels with |IA| > threshold', zone, _pct(artifact, in_zone), '%', in_zone, 'threshold {:.0f}%'.format(ia_threshold * 100))
-        if gd_result is not None:
-            valid = in_zone & gd_result['mask']
-            detail = 'threshold {:g} mm'.format(gd_threshold_mm)
-            for i in range(3):
-                displacement_mm = np.abs(gd_result['gd_map'][..., i] * resolution_mm[i])
-                displaced = valid & (displacement_mm > gd_threshold_mm)
-                name = 'GD: volume displaced > threshold along {}'.format(axis_labels[i])
-                add(name + ' [% of valid]', zone, _pct(displaced, valid), '%', valid, detail)
-                add(name + ' [voxels]', zone, np.sum(displaced), 'voxels', valid, detail)
-                add(name + ' [cm3]', zone, np.sum(displaced) * voxel_cm3, 'cm3', valid, detail)
-                add('GD: max |displacement| along {}'.format(axis_labels[i]), zone,
-                    displacement_mm[valid].max() if valid.any() else None, 'mm', valid)
-        if snr_result is not None:
-            valid = in_zone & snr_result['mask'] & (snr_result['snr_map'] > 0)
-            add('SNR: median', zone, np.median(snr_result['snr_map'][valid]) if valid.any() else None, '', valid)
-        if sr_result is not None:
-            for i in range(2):
-                fwhm = sr_result['fwhm'][..., i]
-                valid = in_zone & (fwhm > 0)
-                add('SR: median FWHM along {}'.format(axis_labels[i]), zone, np.median(fwhm[valid]) if valid.any() else None, 'mm', valid)
-                for p, thresholds in sr_thresholds.items():
-                    blurred = valid & (fwhm > thresholds[i])
-                    detail = 'plastic P{} = {:.2f} mm'.format(p, thresholds[i])
-                    name = 'SR: BV along {} (> plastic P{})'.format(axis_labels[i], p)
-                    add(name + ' [% of valid]', zone, _pct(blurred, valid), '%', valid, detail)
-                    add(name + ' [voxels]', zone, np.sum(blurred), 'voxels', valid, detail)
-                    add(name + ' [cm3]', zone, np.sum(blurred) * voxel_cm3, 'cm3', valid, detail)
-        if ssim_result is not None:
-            valid = in_zone & ssim_result['valid']
-            add('SSIM: mean', zone, ssim_result['ssim_map'][valid].mean() if valid.any() else None, '', valid,
-                'screw excluded, sigma {:g} voxel'.format(ssim_result['sigma']))
-
+    args = (resolution_mm, ia_threshold, ia_result, gd_result, snr_result, sr_result, sr_baseline, ssim_result,
+            gd_threshold_mm, min_coverage_pct, sr_sd, axis_labels)
+    rows = _all_region_rows(zone_result, False, *args)
     _print_zonal(rows, zone_result['names'], min_coverage_pct)
     if save_folder is not None:
-        Path(save_folder).mkdir(parents=True, exist_ok=True)
-        with open(os.path.join(save_folder, 'zonal_summary.csv'), 'w', newline='', encoding='utf-8-sig') as f:
-            writer = csv.DictWriter(f, fieldnames=['measure', 'zone', 'value', 'unit', 'coverage_pct', 'detail'])
-            writer.writeheader()
-            for row in rows:
-                writer.writerow({**row, 'value': '' if row['value'] is None else round(row['value'], 4)})
-        print('\nบันทึกตารางไว้ที่ {}'.format(os.path.join(save_folder, 'zonal_summary.csv')))
+        _write_rows(rows, os.path.join(save_folder, 'zonal_summary.csv'))
+        _write_rows(_all_region_rows(zone_result, True, *args), os.path.join(save_folder, 'slice_summary.csv'))
+        print('\nบันทึกตารางไว้ที่ {} (และค่าราย slice ใน slice_summary.csv)'.format(os.path.join(save_folder, 'zonal_summary.csv')))
     return rows
 
 
@@ -541,10 +573,10 @@ def _dark_axes(ax):
 def _bar_panels(measures):
     """ Pick measures to plot: percentages share a 0-100 scale; SSIM gets its own 0-1 panel. """
     # SR: only the primary (first listed) percentile threshold, as % of valid voxels
-    sr_primary = next((re.search(r'plastic P\d+', m).group() for m in measures if m.startswith('SR: BV')), None)
+    sr_primary = next((re.search(r'\(> plastic [^)]*\)', m).group() for m in measures if m.startswith('SR: BV')), None)
     return [m for m in measures if m.startswith(('IA:', 'SSIM'))
             or (m.startswith('GD: volume') and m.endswith('[% of valid]'))
-            or (sr_primary is not None and m.startswith('SR: BV') and sr_primary + ')' in m and m.endswith('[% of valid]'))]
+            or (sr_primary is not None and m.startswith('SR: BV') and sr_primary in m and m.endswith('[% of valid]'))]
 
 
 def _wrap(text, width=34):
@@ -635,3 +667,132 @@ def compare_conditions(conditions, save_folder=None):
                 for zone in zone_names:
                     writer.writerow([measure, zone] + ['' if value(name, measure, zone) is None else value(name, measure, zone) for name in conditions])
         print('บันทึกตารางเปรียบเทียบไว้ที่ {}'.format(os.path.join(save_folder, 'comparison.csv')))
+
+
+def _holm(p_values):
+    """ Holm-adjusted p-values (family-wise error control). """
+    order = np.argsort(p_values)
+    adjusted = np.empty(len(p_values))
+    running = 0.0
+    for rank, i in enumerate(order):
+        running = max(running, min(1.0, (len(p_values) - rank) * p_values[i]))
+        adjusted[i] = running
+    return adjusted
+
+
+def _read_csv(path):
+    with open(path, encoding='utf-8-sig') as f:
+        return list(csv.DictReader(f))
+
+
+def _test_group(table, names):
+    """ Friedman test across protocols (columns) over blocks (rows), then pairwise Wilcoxon signed-rank with Holm. """
+    from scipy.stats import friedmanchisquare, wilcoxon
+    data = np.array(table, dtype=float)
+    n, k = data.shape
+    result = {'n_blocks': n, 'chi2': None, 'p': None, 'kendall_w': None}
+    pairs = []
+    if n < 3 or k < 3:
+        return result, pairs
+    if np.all(data == data[:, :1]):
+        result.update(chi2=0.0, p=1.0, kendall_w=0.0)
+    else:
+        chi2, p = friedmanchisquare(*data.T)
+        result.update(chi2=float(chi2), p=float(p), kendall_w=float(chi2 / (n * (k - 1))))
+    raw = []
+    for a in range(k):
+        for b in range(a + 1, k):
+            diff = data[:, a] - data[:, b]
+            p_pair = 1.0 if np.all(diff == 0) else float(wilcoxon(data[:, a], data[:, b]).pvalue)
+            raw.append(p_pair)
+            pairs.append({'protocol_a': names[a], 'protocol_b': names[b], 'median_difference': float(np.median(diff)), 'p_raw': p_pair})
+    for pair, p_holm in zip(pairs, _holm(np.array(raw))):
+        pair['p_holm'] = float(p_holm)
+        pair['significant'] = bool(p_holm < 0.05)
+    return result, pairs
+
+
+def compare_statistics(protocols, design='repeat_zone', save_folder=None):
+    """Statistical comparison of protocols with the Friedman test and post-hoc Wilcoxon signed-rank (Holm).
+
+    design 'repeat_zone': protocols maps each protocol name to a list of result folders, one per repeat, in the
+        same repeat order for every protocol; blocks are repeat x zone (e.g. 3 repeats x 3 zones = 9 blocks).
+    design 'zone_slice': protocols maps each protocol name to one result folder from a single phantom placement;
+        blocks are slices, tested separately within each zone. Adjacent slices are correlated, so p-values are optimistic.
+    Saves stats_friedman.csv, stats_posthoc.csv and stats_descriptive.csv.
+    """
+    names = list(protocols)
+    tests, posthoc, descriptive = [], [], []
+    if design == 'repeat_zone':
+        repeats = {name: [_read_csv(os.path.join(folder, 'zonal_summary.csv')) for folder in folders] for name, folders in protocols.items()}
+        if len({len(r) for r in repeats.values()}) != 1:
+            raise ValueError('ทุก protocol ต้องมีจำนวนรอบเท่ากัน')
+        lookup = {(name, i, row['measure'], row['zone']): row['value']
+                  for name in names for i, rows in enumerate(repeats[name]) for row in rows}
+        first = repeats[names[0]][0]
+        groups = {}
+        for row in first:
+            for i in range(len(repeats[names[0]])):
+                groups.setdefault((row['measure'], 'all zones'), []).append((i, row['zone']))
+        for (measure, label), blocks in groups.items():
+            if measure.endswith('[voxels]'):
+                continue
+            table = []
+            for i, zone in blocks:
+                values = [lookup.get((name, i, measure, zone), '') for name in names]
+                if all(v not in ('', None) for v in values):
+                    table.append([float(v) for v in values])
+            result, pairs = _test_group(table, names)
+            tests.append({'measure': measure, 'group': label, **result})
+            posthoc += [{'measure': measure, 'group': label, **pair} for pair in pairs]
+            for zone in dict.fromkeys(z for _, z in blocks):
+                for name in names:
+                    values = [lookup.get((name, i, measure, zone), '') for i in range(len(repeats[name]))]
+                    values = [float(v) for v in values if v not in ('', None)]
+                    descriptive.append({'measure': measure, 'zone': zone, 'protocol': name, 'n': len(values),
+                                        'mean': np.mean(values) if values else None, 'sd': np.std(values, ddof=1) if len(values) > 1 else None})
+    elif design == 'zone_slice':
+        slices = {name: _read_csv(os.path.join(folder, 'slice_summary.csv')) for name, folder in protocols.items()}
+        lookup = {(name, row['measure'], row['zone'], row['slice']): row['value'] for name in names for row in slices[name]}
+        groups = {}
+        for row in slices[names[0]]:
+            groups.setdefault((row['measure'], row['zone']), []).append(row['slice'])
+        for (measure, zone), slice_ids in groups.items():
+            if measure.endswith('[voxels]'):
+                continue
+            table = []
+            for k in slice_ids:
+                values = [lookup.get((name, measure, zone, k), '') for name in names]
+                if all(v not in ('', None) for v in values):
+                    table.append([float(v) for v in values])
+            result, pairs = _test_group(table, names)
+            tests.append({'measure': measure, 'group': zone, **result})
+            posthoc += [{'measure': measure, 'group': zone, **pair} for pair in pairs]
+            column = np.array(table) if table else np.zeros((0, len(names)))
+            for j, name in enumerate(names):
+                descriptive.append({'measure': measure, 'zone': zone, 'protocol': name, 'n': len(column),
+                                    'mean': column[:, j].mean() if len(column) else None,
+                                    'sd': column[:, j].std(ddof=1) if len(column) > 1 else None})
+        print('คำเตือน: slice ที่อยู่ติดกันมีค่าสัมพันธ์กัน ค่า p จากแบบ zone x slice จึงต่ำกว่าความเป็นจริง ต้องรายงานเป็นข้อจำกัด\n')
+    else:
+        raise ValueError("design ต้องเป็น 'repeat_zone' หรือ 'zone_slice'")
+
+    shown = _bar_panels(list(dict.fromkeys(t['measure'] for t in tests)))
+    print('{:<66}{:<20}{:>4}{:>9}{:>10}{:>8}'.format('ค่า', 'กลุ่ม', 'n', 'chi2', 'p', 'W'))
+    for t in tests:
+        if t['measure'] in shown:
+            if t['p'] is None:
+                print('{:<66}{:<20}{:>4}   ทดสอบไม่ได้ (ต้องมีอย่างน้อย 3 block และ 3 protocol)'.format(t['measure'][:65], t['group'][:19], t['n_blocks']))
+            else:
+                print('{:<66}{:<20}{:>4}{:>9.2f}{:>10.2g}{:>8.2f}'.format(t['measure'][:65], t['group'][:19], t['n_blocks'], t['chi2'], t['p'], t['kendall_w']))
+    print('\nแสดงเฉพาะค่าหลัก ผลครบทุกค่าและ post-hoc อยู่ในไฟล์ CSV;  W = Kendall\'s W (0 = ไม่สม่ำเสมอ, 1 = อันดับเหมือนกันทุก block)')
+    if save_folder is not None:
+        Path(save_folder).mkdir(parents=True, exist_ok=True)
+        for filename, rows in (('stats_friedman.csv', tests), ('stats_posthoc.csv', posthoc), ('stats_descriptive.csv', descriptive)):
+            if rows:
+                with open(os.path.join(save_folder, filename), 'w', newline='', encoding='utf-8-sig') as f:
+                    writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                    writer.writeheader()
+                    writer.writerows(rows)
+        print('บันทึกไว้ที่ {} (stats_friedman.csv, stats_posthoc.csv, stats_descriptive.csv)'.format(save_folder))
+    return tests, posthoc, descriptive
